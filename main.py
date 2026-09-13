@@ -1,28 +1,24 @@
-#python
+
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from dotenv import load_dotenv
 import os
-
-from model import generate_response
+import requests
 
 
 # ==========================================
-# LOAD ENVIRONMENT VARIABLES
+# ENVIRONMENT VARIABLES
 # ==========================================
-
-load_dotenv()
 
 MY_API_KEY = os.getenv("MY_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-
-# Check API key configuration
 if not MY_API_KEY:
-    raise RuntimeError(
-        "MY_API_KEY not found. Please create a .env file."
-    )
+    raise RuntimeError("MY_API_KEY is not configured.")
+
+if not HF_TOKEN:
+    raise RuntimeError("HF_TOKEN is not configured.")
 
 
 # ==========================================
@@ -31,8 +27,8 @@ if not MY_API_KEY:
 
 app = FastAPI(
     title="Anurag AI API",
-    description="Custom AI Chat API with API key authentication",
-    version="2.0.0"
+    description="Custom AI Chat API",
+    version="3.0.0"
 )
 
 
@@ -40,7 +36,6 @@ app = FastAPI(
 # MEMORY
 # ==========================================
 
-# Stores conversation history for each session
 conversation_memory = {}
 
 
@@ -67,20 +62,7 @@ class ChatResponse(BaseModel):
 
 
 # ==========================================
-# HOME
-# ==========================================
-
-@app.get("/")
-def home():
-    return {
-        "message": "Welcome to Anurag AI API",
-        "status": "running",
-        "version": "2.0.0"
-    }
-
-
-# ==========================================
-# API KEY VERIFICATION
+# VERIFY API KEY
 # ==========================================
 
 def verify_api_key(x_api_key: str):
@@ -99,7 +81,87 @@ def verify_api_key(x_api_key: str):
 
 
 # ==========================================
-# SIMPLE AI ENDPOINT
+# HUGGING FACE AI
+# ==========================================
+
+def generate_response(prompt: str):
+
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+
+    url = (
+        f"https://router.huggingface.co/hf-inference/"
+        f"models/{model_name}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 100,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "return_full_text": False
+        }
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=data,
+            timeout=120
+        )
+
+        if response.status_code != 200:
+            raise Exception(
+                f"Hugging Face API error: "
+                f"{response.status_code} - {response.text}"
+            )
+
+        result = response.json()
+
+        if isinstance(result, list) and len(result) > 0:
+
+            return result[0].get(
+                "generated_text",
+                "I could not generate a response."
+            ).strip()
+
+        if isinstance(result, dict):
+
+            if "error" in result:
+                raise Exception(result["error"])
+
+        return "I could not generate a response."
+
+    except requests.exceptions.Timeout:
+
+        raise Exception(
+            "AI request timed out. Please try again."
+        )
+
+
+# ==========================================
+# HOME
+# ==========================================
+
+@app.get("/")
+def home():
+
+    return {
+        "message": "Welcome to Anurag AI API",
+        "status": "running",
+        "version": "3.0.0"
+    }
+
+
+# ==========================================
+# SIMPLE AI
 # ==========================================
 
 @app.post("/ai", response_model=AIResponse)
@@ -110,23 +172,34 @@ def ask_ai(
 
     verify_api_key(x_api_key)
 
+    prompt = request.prompt.strip()
+
+    if not prompt:
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt cannot be empty"
+        )
+
     try:
-        result = generate_response(request.prompt)
+
+        result = generate_response(prompt)
 
         return {
             "response": result
         }
 
     except Exception as e:
+
         raise HTTPException(
             status_code=500,
-            detail=f"AI model error: {str(e)}"
+            detail=f"AI error: {str(e)}"
         )
 
 
 # ==========================================
-# CHAT ENDPOINT
+# CHAT
 # ==========================================
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(
     request: ChatRequest,
@@ -150,14 +223,10 @@ def chat(
 
     history = conversation_memory[session_id]
 
-    # Save user message
-    history.append({
-        "role": "user",
-        "content": message
-    })
-
     # Build conversation
-    conversation_prompt = ""
+    conversation_prompt = (
+        "You are Anurag AI, a helpful and friendly AI assistant.\n\n"
+    )
 
     for item in history:
 
@@ -173,6 +242,9 @@ def chat(
                 f"Anurag AI: {item['content']}\n"
             )
 
+    conversation_prompt += f"User: {message}\n"
+    conversation_prompt += "Anurag AI:"
+
     try:
 
         response = generate_response(
@@ -181,7 +253,12 @@ def chat(
 
         response = response.strip()
 
-        # Save AI response
+        # Save conversation
+        history.append({
+            "role": "user",
+            "content": message
+        })
+
         history.append({
             "role": "assistant",
             "content": response
@@ -194,72 +271,14 @@ def chat(
 
     except Exception as e:
 
-        # Remove failed user message
-        if history and history[-1]["role"] == "user":
-            history.pop()
-
         raise HTTPException(
             status_code=500,
-            detail=f"AI model error: {str(e)}"
-        )
-
-    # Create a new conversation if session doesn't exist
-    if session_id not in conversation_memory:
-        conversation_memory[session_id] = []
-
-    # Get previous conversation
-    history = conversation_memory[session_id]
-
-    # Add current user message
-    history.append({
-        "role": "user",
-        "content": message
-    })
-
-    # Create conversation prompt
-    conversation_prompt = ""
-
-    for item in history:
-        if item["role"] == "user":
-            conversation_prompt += f"User: {item['content']}\n"
-
-        elif item["role"] == "assistant":
-            conversation_prompt += f"Anurag AI: {item['content']}\n"
-
-    conversation_prompt += "Anurag AI:"
-
-    try:
-
-        # Generate AI response
-        response = generate_response(conversation_prompt)
-
-        response = response.strip()
-
-        # Save AI response in memory
-        history.append({
-            "role": "assistant",
-            "content": response
-        })
-
-        return {
-            "session_id": session_id,
-            "response": response
-        }
-
-    except Exception as e:
-
-        # Remove user message if model fails
-        if history and history[-1]["role"] == "user":
-            history.pop()
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"AI model error: {str(e)}"
+            detail=f"AI error: {str(e)}"
         )
 
 
 # ==========================================
-# CLEAR CHAT MEMORY
+# CLEAR MEMORY
 # ==========================================
 
 @app.delete("/clear-memory/{session_id}")
@@ -271,6 +290,7 @@ def clear_memory(
     verify_api_key(x_api_key)
 
     if session_id in conversation_memory:
+
         del conversation_memory[session_id]
 
         return {
@@ -279,13 +299,13 @@ def clear_memory(
         }
 
     return {
-        "message": "No conversation found for this session",
+        "message": "No conversation found",
         "session_id": session_id
     }
 
 
 # ==========================================
-# VIEW CHAT HISTORY
+# CHAT HISTORY
 # ==========================================
 
 @app.get("/history/{session_id}")
@@ -303,17 +323,23 @@ def get_history(
             []
         )
     }
-# Serve website files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# ==========================================
+# WEBSITE
+# ==========================================
+
+app.mount(
+    "/static",
+    StaticFiles(directory="static"),
+    name="static"
+)
 
 
 @app.get("/website")
 def website():
-    return FileResponse("static/index.html")
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+    return FileResponse(
+        "static/index.html"
+    )
 
-
-@app.get("/website")
-def website():
-    return FileResponse("static/index.html")
