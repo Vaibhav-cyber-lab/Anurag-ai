@@ -1,1 +1,1 @@
-# anurag ai
+# anurag-ai
